@@ -222,12 +222,33 @@ _REACTION_EMOJI: dict = {
     # Numeric types
     2000: "❤️", 2001: "👍", 2002: "👎",
     2003: "😂", 2004: "‼️", 2005: "❓",
-    # Remove reactions
+    # Remove reactions (string)
+    "-love": "-❤️", "-like": "-👍", "-dislike": "-👎",
+    "-laugh": "-😂", "-emphasize": "-‼️", "-question": "-❓",
+    # Remove reactions (numeric)
     3000: "-❤️", 3001: "-👍", 3002: "-👎",
     3003: "-😂", 3004: "-‼️", 3005: "-❓",
     # Sticker
     4000: "🏷️",
+    # 2006 = iOS 17+ any-emoji reaction (actual emoji extracted from text field)
 }
+
+# Regex to extract the emoji from iOS 17+ reaction text like "Reacted 🔥 to ..."
+_IOS17_REACTION_RE = re.compile(r"Reacted\s+(.+?)\s+to\s+")
+
+
+def _resolve_reaction_emoji(assoc_type, msg_text: str) -> str:
+    """Resolve a reaction type to its display emoji."""
+    # Check static map first
+    static = _REACTION_EMOJI.get(assoc_type)
+    if static:
+        return static
+    # iOS 17+ any-emoji reactions (type "2006" or 2006): extract from text
+    if str(assoc_type) == "2006" and msg_text:
+        match = _IOS17_REACTION_RE.search(msg_text)
+        if match:
+            return match.group(1).strip()
+    return str(assoc_type)
 
 
 def _strip_part_prefix(guid: str) -> str:
@@ -250,7 +271,7 @@ def format_message(msg: dict) -> str:
 
     assoc_type = msg.get("associatedMessageType")
     if assoc_type:
-        emoji = _REACTION_EMOJI.get(assoc_type, str(assoc_type))
+        emoji = _resolve_reaction_emoji(assoc_type, (msg.get("text") or ""))
         target_guid = msg.get("associatedMessageGuid", "")
         return f"[{ts}] {sender} reacted {emoji} to message {target_guid}"
 
@@ -310,9 +331,9 @@ def _format_messages_grouped(messages: list) -> list[str]:
         if assoc_type:
             raw_target = msg.get("associatedMessageGuid", "")
             target = _strip_part_prefix(raw_target)
-            emoji = _REACTION_EMOJI.get(assoc_type, str(assoc_type))
-            sender = _sender_name(msg)
             reaction_text = (msg.get("text") or "").strip()
+            emoji = _resolve_reaction_emoji(assoc_type, reaction_text)
+            sender = _sender_name(msg)
             reactions_by_target.setdefault(target, []).append(
                 (sender, emoji, reaction_text)
             )
