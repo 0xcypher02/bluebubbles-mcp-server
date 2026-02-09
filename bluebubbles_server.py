@@ -804,6 +804,7 @@ async def query_chats(
 async def get_contact_chat_history(
     name: str,
     limit: int = 50,
+    offset: int = 0,
 ) -> str:
     """Get complete chat history with a contact by their name. Automatically
     finds ALL chats (phone + email) and merges messages chronologically.
@@ -814,6 +815,7 @@ async def get_contact_chat_history(
     Args:
         name: Contact name (e.g. 'Nick Balenzano').
         limit: Total messages to return across all chats (default 50).
+        offset: Number of messages to skip in merged results (for pagination).
 
     Returns:
         Merged message history from all chats with this contact.
@@ -872,9 +874,11 @@ async def get_contact_chat_history(
             if chat:
                 chat_guids.append((addr, guid))
                 # Get messages from this chat
+                # Over-fetch to ensure correct pagination across merged sources
+                fetch_limit = (offset + limit) * 2
                 msg_resp = await api_request("message/query", method="POST", data={
                     "chatGuid": guid,
-                    "limit": limit * 2,  # Over-fetch to ensure we get enough across all chats
+                    "limit": min(fetch_limit, 1000),  # Cap at API max
                     "sort": "DESC",
                     "with": ["handle", "attachment"],
                 })
@@ -889,17 +893,23 @@ async def get_contact_chat_history(
     # Sort all messages by date (newest first)
     all_messages.sort(key=lambda m: m.get("dateCreated", 0), reverse=True)
 
-    # Take top N after merge
-    merged = all_messages[:limit]
+    # Apply pagination to merged results
+    total_merged = len(all_messages)
+    merged = all_messages[offset:offset + limit]
 
+    start_num = offset + 1
+    end_num = offset + len(merged)
     lines = [
-        f"Chat history with {contact_name} ({len(merged)} messages from {len(chat_guids)} chat(s))",
+        f"Chat history with {contact_name} (showing {start_num}-{end_num} of {total_merged} merged messages)",
         "=" * 40,
     ]
     if len(chat_guids) > 1:
-        lines.append(f"Note: {contact_name} has {len(chat_guids)} chats (phone + email merged):")
+        lines.append(f"Note: {contact_name} has {len(chat_guids)} chats merged:")
         for addr, guid in chat_guids:
             lines.append(f"  - {addr}")
+        lines.append("")
+    elif offset > 0:
+        lines.append(f"Showing messages {start_num}-{end_num} of {total_merged}")
         lines.append("")
 
     lines.extend(_format_messages_grouped(merged))
