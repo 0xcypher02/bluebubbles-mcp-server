@@ -1140,58 +1140,35 @@ async def find_chat_by_address(
     Returns:
         Chat GUID if found, or message indicating no chat exists.
     """
-    # Direct query by chatIdentifier (fast, no need to scan all chats)
-    resp = await api_request("chat/query", method="POST", data={
-        "limit": 1,
-        "where": [
-            {
-                "statement": "chat.chatIdentifier = :identifier",
-                "args": {"identifier": address},
-            }
-        ],
-    })
-    chats = _extract_data(resp) or []
-
-    if chats:
-        chat = chats[0]
-        guid = chat.get("guid", "")
-        identifier = chat.get("chatIdentifier", "")
-        style = chat.get("style", 0)
-        chat_type = "Group" if style == 43 else "Direct Message"
-        display = chat.get("displayName") or _resolve_name(identifier)
-        return (
-            f"Found chat with {display}:\n"
-            f"  GUID: {guid}\n"
-            f"  Type: {chat_type}\n"
-            f"  Identifier: {identifier}\n\n"
-            f"Use send_message(chat_guid=\"{guid}\", message=\"...\") to send."
-        )
-
-    # No exact match - try normalized phone lookup
+    # For DM chats, the GUID is constructed as any;-;{address}
+    # Try both the original and normalized addresses
+    test_addresses = [address]
     normalized = _normalize_phone(address)
     if normalized != address:
-        resp2 = await api_request("chat/query", method="POST", data={
-            "limit": 1,
-            "where": [
-                {
-                    "statement": "chat.chatIdentifier = :identifier",
-                    "args": {"identifier": normalized},
-                }
-            ],
-        })
-        chats2 = _extract_data(resp2) or []
-        if chats2:
-            chat = chats2[0]
-            guid = chat.get("guid", "")
-            identifier = chat.get("chatIdentifier", "")
-            display = _resolve_name(identifier)
-            return (
-                f"Found chat with {display}:\n"
-                f"  GUID: {guid}\n"
-                f"  Type: Direct Message\n"
-                f"  Identifier: {identifier}\n\n"
-                f"Use send_message(chat_guid=\"{guid}\", message=\"...\") to send."
-            )
+        test_addresses.append(normalized)
+
+    for addr in test_addresses:
+        # Construct DM chat GUID
+        constructed_guid = f"any;-;{addr}"
+        try:
+            resp = await api_request(f"chat/{constructed_guid}")
+            chat = _extract_data(resp)
+            if chat:
+                guid = chat.get("guid", "")
+                identifier = chat.get("chatIdentifier", "")
+                style = chat.get("style", 0)
+                chat_type = "Group" if style == 43 else "Direct Message"
+                display = chat.get("displayName") or _resolve_name(identifier)
+                return (
+                    f"Found chat with {display}:\n"
+                    f"  GUID: {guid}\n"
+                    f"  Type: {chat_type}\n"
+                    f"  Identifier: {identifier}\n\n"
+                    f"Use send_message(chat_guid=\"{guid}\", message=\"...\") to send."
+                )
+        except Exception:
+            # 404 or other error - try next address format
+            continue
 
     return (
         f"No existing chat found with {address}.\n"
@@ -1280,41 +1257,25 @@ async def send_message_to_new_chat(
     """
     # Try to find existing chat first (much faster than /chat/new)
     if len(addresses) == 1:
-        # Single recipient: direct query by chatIdentifier
+        # Single recipient: DM chat GUIDs are constructed as any;-;{address}
         addr = addresses[0]
-        search_resp = await api_request("chat/query", method="POST", data={
-            "limit": 1,
-            "where": [
-                {
-                    "statement": "chat.chatIdentifier = :identifier",
-                    "args": {"identifier": addr},
-                }
-            ],
-        })
-        chats = _extract_data(search_resp) or []
-        if chats:
-            chat_guid = chats[0].get("guid", "")
-            if chat_guid:
-                # Found existing chat - use fast send_message path
-                return await send_message(chat_guid, message)
-
-        # Try normalized phone if different
+        test_addresses = [addr]
         normalized = _normalize_phone(addr)
         if normalized != addr:
-            search_resp2 = await api_request("chat/query", method="POST", data={
-                "limit": 1,
-                "where": [
-                    {
-                        "statement": "chat.chatIdentifier = :identifier",
-                        "args": {"identifier": normalized},
-                    }
-                ],
-            })
-            chats2 = _extract_data(search_resp2) or []
-            if chats2:
-                chat_guid = chats2[0].get("guid", "")
-                if chat_guid:
-                    return await send_message(chat_guid, message)
+            test_addresses.append(normalized)
+
+        for test_addr in test_addresses:
+            constructed_guid = f"any;-;{test_addr}"
+            try:
+                # Try GET /chat/{guid} - if chat exists, use it
+                resp = await api_request(f"chat/{constructed_guid}")
+                chat = _extract_data(resp)
+                if chat and chat.get("guid"):
+                    # Found existing chat - use fast send_message path
+                    return await send_message(chat.get("guid"), message)
+            except Exception:
+                # 404 - chat doesn't exist, continue
+                continue
 
     # No existing chat found - fall back to slow /chat/new endpoint
     # This will take 120 seconds to timeout but the message WILL send successfully
@@ -1775,6 +1736,128 @@ async def query_contacts(addresses: list[str]) -> str:
         lines.append(format_contact(c))
         lines.append("")
     return "\n".join(lines)
+
+
+@mcp.tool()
+@_safe_call
+async def find_contact_by_name(
+    name: str,
+) -> str:
+    """Find a contact by searching for their name. Returns matching contacts
+    with phone numbers and emails.
+
+    Use this when you know someone's name but need their phone number to send
+    a message. Then use find_chat_by_address or send_message_to_contact.
+
+    Args:
+        name: Full or partial name to search for (case-insensitive).
+            Example: 'Nick Balenzano', 'Nick', 'Balenzano'.
+    """
+    resp = await api_request("contact")
+    contacts = _extract_data(resp) or []
+
+    search_lower = name.lower()
+    matches = []
+    for c in contacts:
+        display = (c.get("displayName") or "").strip()
+        first = (c.get("firstName") or "").strip()
+        last = (c.get("lastName") or "").strip()
+        full = f"{first} {last}".strip()
+
+        # Match against display name, first name, last name, or full name
+        if (search_lower in display.lower() or
+            search_lower in first.lower() or
+            search_lower in last.lower() or
+            search_lower in full.lower()):
+            phones = c.get("phoneNumbers") or []
+            emails = c.get("emails") or []
+            matches.append({
+                "name": display or full or "Unknown",
+                "phones": [p.get("address", "") for p in phones if p.get("address")],
+                "emails": [e.get("address", "") for e in emails if e.get("address")],
+            })
+
+    if not matches:
+        return f"No contacts found matching '{name}'."
+
+    lines = [f"Found {len(matches)} contact(s) matching '{name}':", "=" * 40]
+    for m in matches[:10]:  # Limit to 10 matches
+        lines.append(f"{m['name']}")
+        for phone in m['phones']:
+            lines.append(f"  Phone: {phone}")
+        for email in m['emails']:
+            lines.append(f"  Email: {email}")
+        if m['phones'] or m['emails']:
+            primary = m['phones'][0] if m['phones'] else m['emails'][0]
+            lines.append(f"  → Use find_chat_by_address(\"{primary}\") to get chat GUID")
+        lines.append("")
+
+    if len(matches) > 10:
+        lines.append(f"... and {len(matches) - 10} more matches")
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
+@_safe_call
+async def send_message_to_contact(
+    name: str,
+    message: str,
+) -> str:
+    """Send a message to a contact by their name. Automatically looks up the
+    contact, finds their chat, and sends the message.
+
+    This is a convenience tool that combines find_contact_by_name,
+    find_chat_by_address, and send_message into one step.
+
+    Args:
+        name: Contact name to send to (e.g. 'Nick Balenzano').
+        message: The message to send.
+    """
+    # Find contact by name
+    resp = await api_request("contact")
+    contacts = _extract_data(resp) or []
+
+    search_lower = name.lower()
+    found_contact = None
+    for c in contacts:
+        display = (c.get("displayName") or "").strip()
+        first = (c.get("firstName") or "").strip()
+        last = (c.get("lastName") or "").strip()
+        full = f"{first} {last}".strip()
+
+        if (search_lower in display.lower() or
+            search_lower in first.lower() or
+            search_lower in last.lower() or
+            search_lower in full.lower()):
+            # Use first match
+            found_contact = c
+            break
+
+    if not found_contact:
+        return f"No contact found matching '{name}'. Use find_contact_by_name to search."
+
+    # Get primary phone or email
+    phones = found_contact.get("phoneNumbers") or []
+    emails = found_contact.get("emails") or []
+    primary_address = None
+    if phones:
+        primary_address = phones[0].get("address", "")
+    elif emails:
+        primary_address = emails[0].get("address", "")
+
+    if not primary_address:
+        contact_name = (found_contact.get("displayName") or
+                       f"{found_contact.get('firstName', '')} {found_contact.get('lastName', '')}".strip())
+        return f"Contact '{contact_name}' found but has no phone numbers or emails."
+
+    contact_name = (found_contact.get("displayName") or
+                   f"{found_contact.get('firstName', '')} {found_contact.get('lastName', '')}".strip())
+
+    # Find or create chat with this address
+    # Use the existing send_message_to_new_chat logic which searches first
+    result = await send_message_to_new_chat([primary_address], message)
+    return f"Sent to {contact_name} ({primary_address}):\n{result}"
 
 
 # ===================================================================
