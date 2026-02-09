@@ -812,8 +812,15 @@ async def get_chat_messages(
 ) -> str:
     """Get messages from a specific chat with pagination and time filtering.
 
+    To read someone's chat by name:
+    1. find_contact_by_name("Nick Balenzano") → get phone number
+    2. find_chat_by_address("+12039698060") → get chat_guid
+    3. get_chat_messages(chat_guid="...") → read messages
+
+    Or use query_chats() to browse all chats and pick one.
+
     Args:
-        chat_guid: The GUID of the chat.
+        chat_guid: The GUID of the chat. Get via find_chat_by_address or query_chats.
         limit: Maximum number of messages to return (default 25).
         offset: Number of messages to skip (default 0).
         sort: Sort order - 'ASC' for oldest first, 'DESC' for newest first (default 'DESC').
@@ -1129,10 +1136,14 @@ async def query_messages(
 async def find_chat_by_address(
     address: str,
 ) -> str:
-    """Find a chat (DM or group) by phone number or email address.
+    """Find a chat (DM or group) by phone number or email address. Returns the
+    chat_guid needed for reading messages or sending.
 
-    Use this to get a chat_guid before sending a message with send_message.
-    Much faster than send_message_to_new_chat (which has a 120s timeout).
+    Common workflows:
+    - Read someone's chat: find_chat_by_address → get_chat_messages
+    - Send to someone: find_chat_by_address → send_message
+
+    Note: send_message_to_new_chat has 120s timeout, so this + send_message is faster.
 
     Args:
         address: Phone number (e.g. '+12039698060') or email to search for.
@@ -1746,8 +1757,10 @@ async def find_contact_by_name(
     """Find a contact by searching for their name. Returns matching contacts
     with phone numbers and emails.
 
-    Use this when you know someone's name but need their phone number to send
-    a message. Then use find_chat_by_address or send_message_to_contact.
+    Use this when you know someone's name but need their phone/email to:
+    - Send a message → find_chat_by_address then send_message
+    - Read their chat → find_chat_by_address then get_chat_messages
+    - Quick send → send_message_to_contact (does both steps)
 
     Args:
         name: Full or partial name to search for (case-insensitive).
