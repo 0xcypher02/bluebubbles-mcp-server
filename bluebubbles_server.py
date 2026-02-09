@@ -1140,29 +1140,58 @@ async def find_chat_by_address(
     Returns:
         Chat GUID if found, or message indicating no chat exists.
     """
-    # Query recent chats
+    # Direct query by chatIdentifier (fast, no need to scan all chats)
     resp = await api_request("chat/query", method="POST", data={
-        "limit": 200,
-        "sort": "lastmessage",
+        "limit": 1,
+        "where": [
+            {
+                "statement": "chat.chatIdentifier = :identifier",
+                "args": {"identifier": address},
+            }
+        ],
     })
     chats = _extract_data(resp) or []
 
-    # Search for matching chat
-    normalized_search = _normalize_phone(address)
-    for chat in chats:
+    if chats:
+        chat = chats[0]
+        guid = chat.get("guid", "")
+        identifier = chat.get("chatIdentifier", "")
         style = chat.get("style", 0)
-        if style == 45:  # DM
+        chat_type = "Group" if style == 43 else "Direct Message"
+        display = chat.get("displayName") or _resolve_name(identifier)
+        return (
+            f"Found chat with {display}:\n"
+            f"  GUID: {guid}\n"
+            f"  Type: {chat_type}\n"
+            f"  Identifier: {identifier}\n\n"
+            f"Use send_message(chat_guid=\"{guid}\", message=\"...\") to send."
+        )
+
+    # No exact match - try normalized phone lookup
+    normalized = _normalize_phone(address)
+    if normalized != address:
+        resp2 = await api_request("chat/query", method="POST", data={
+            "limit": 1,
+            "where": [
+                {
+                    "statement": "chat.chatIdentifier = :identifier",
+                    "args": {"identifier": normalized},
+                }
+            ],
+        })
+        chats2 = _extract_data(resp2) or []
+        if chats2:
+            chat = chats2[0]
+            guid = chat.get("guid", "")
             identifier = chat.get("chatIdentifier", "")
-            if identifier == address or _normalize_phone(identifier) == normalized_search:
-                guid = chat.get("guid", "")
-                display = chat.get("displayName") or _resolve_name(identifier)
-                return (
-                    f"Found chat with {display}:\n"
-                    f"  GUID: {guid}\n"
-                    f"  Type: Direct Message\n"
-                    f"  Identifier: {identifier}\n\n"
-                    f"Use send_message(chat_guid=\"{guid}\", message=\"...\") to send."
-                )
+            display = _resolve_name(identifier)
+            return (
+                f"Found chat with {display}:\n"
+                f"  GUID: {guid}\n"
+                f"  Type: Direct Message\n"
+                f"  Identifier: {identifier}\n\n"
+                f"Use send_message(chat_guid=\"{guid}\", message=\"...\") to send."
+            )
 
     return (
         f"No existing chat found with {address}.\n"
@@ -1251,23 +1280,41 @@ async def send_message_to_new_chat(
     """
     # Try to find existing chat first (much faster than /chat/new)
     if len(addresses) == 1:
-        # Single recipient: search for existing DM
+        # Single recipient: direct query by chatIdentifier
         addr = addresses[0]
         search_resp = await api_request("chat/query", method="POST", data={
-            "limit": 50,
-            "sort": "lastmessage",
+            "limit": 1,
+            "where": [
+                {
+                    "statement": "chat.chatIdentifier = :identifier",
+                    "args": {"identifier": addr},
+                }
+            ],
         })
         chats = _extract_data(search_resp) or []
-        # Look for chat with matching identifier (DM style = 45)
-        for chat in chats:
-            if chat.get("style") == 45:
-                identifier = chat.get("chatIdentifier", "")
-                # Match if identifiers are same (exact or normalized phone)
-                if identifier == addr or _normalize_phone(identifier) == _normalize_phone(addr):
-                    chat_guid = chat.get("guid", "")
-                    if chat_guid:
-                        # Found existing chat - use fast send_message path
-                        return await send_message(chat_guid, message)
+        if chats:
+            chat_guid = chats[0].get("guid", "")
+            if chat_guid:
+                # Found existing chat - use fast send_message path
+                return await send_message(chat_guid, message)
+
+        # Try normalized phone if different
+        normalized = _normalize_phone(addr)
+        if normalized != addr:
+            search_resp2 = await api_request("chat/query", method="POST", data={
+                "limit": 1,
+                "where": [
+                    {
+                        "statement": "chat.chatIdentifier = :identifier",
+                        "args": {"identifier": normalized},
+                    }
+                ],
+            })
+            chats2 = _extract_data(search_resp2) or []
+            if chats2:
+                chat_guid = chats2[0].get("guid", "")
+                if chat_guid:
+                    return await send_message(chat_guid, message)
 
     # No existing chat found - fall back to slow /chat/new endpoint
     # This will take 120 seconds to timeout but the message WILL send successfully
