@@ -1126,6 +1126,53 @@ async def query_messages(
 
 @mcp.tool()
 @_safe_call
+async def find_chat_by_address(
+    address: str,
+) -> str:
+    """Find a chat (DM or group) by phone number or email address.
+
+    Use this to get a chat_guid before sending a message with send_message.
+    Much faster than send_message_to_new_chat (which has a 120s timeout).
+
+    Args:
+        address: Phone number (e.g. '+12039698060') or email to search for.
+
+    Returns:
+        Chat GUID if found, or message indicating no chat exists.
+    """
+    # Query recent chats
+    resp = await api_request("chat/query", method="POST", data={
+        "limit": 200,
+        "sort": "lastmessage",
+    })
+    chats = _extract_data(resp) or []
+
+    # Search for matching chat
+    normalized_search = _normalize_phone(address)
+    for chat in chats:
+        style = chat.get("style", 0)
+        if style == 45:  # DM
+            identifier = chat.get("chatIdentifier", "")
+            if identifier == address or _normalize_phone(identifier) == normalized_search:
+                guid = chat.get("guid", "")
+                display = chat.get("displayName") or _resolve_name(identifier)
+                return (
+                    f"Found chat with {display}:\n"
+                    f"  GUID: {guid}\n"
+                    f"  Type: Direct Message\n"
+                    f"  Identifier: {identifier}\n\n"
+                    f"Use send_message(chat_guid=\"{guid}\", message=\"...\") to send."
+                )
+
+    return (
+        f"No existing chat found with {address}.\n"
+        f"You can use send_message_to_new_chat(addresses=[\"{address}\"], message=\"...\") "
+        f"to create one, but be aware it has a 120-second timeout (message will send successfully though)."
+    )
+
+
+@mcp.tool()
+@_safe_call
 async def send_message(
     chat_guid: str,
     message: str,
@@ -1134,10 +1181,20 @@ async def send_message(
     effect_id: Optional[str] = None,
     selected_message_guid: Optional[str] = None,
 ) -> str:
-    """Send a text message to an existing chat.
+    """Send a text message to an existing chat. FAST (responds in <1 second).
+
+    PREFERRED METHOD for sending messages. Use query_chats to find the chat_guid
+    for a contact, then use this tool to send. This is 100x faster than
+    send_message_to_new_chat which has a 120-second timeout bug.
+
+    Example workflow:
+    1. query_chats() to find the chat with your contact
+    2. Copy the chat GUID from results
+    3. send_message(chat_guid="...", message="...")
 
     Args:
         chat_guid: The GUID of the chat to send the message to.
+            Find via query_chats or get_chat_messages results.
         message: The text message to send.
         method: Send method - 'apple-script' (default, reliable) or 'private-api' (more features).
         subject: Optional subject line for the message.
@@ -1173,14 +1230,47 @@ async def send_message_to_new_chat(
     addresses: list[str],
     message: str,
 ) -> str:
-    """Send a message to a new or existing chat by phone number(s) or email(s).
-    This creates the chat if it doesn't exist.
+    """Send a message by phone number(s) or email(s). SLOW (120s timeout) - prefer send_message.
+
+    WARNING: This tool has a 120-second timeout bug in BlueBubbles when creating
+    new chats. Messages DO send successfully, but the API waits 2 minutes before
+    responding. For better performance:
+
+    RECOMMENDED: Use query_chats to find existing chat, then send_message with that GUID.
+    Example:
+      1. query_chats() -> find chat with contact
+      2. send_message(chat_guid="...", message="...") -> instant response
+
+    This tool automatically searches for existing chats first to avoid the timeout.
+    Only creates new chats as a last resort.
 
     Args:
         addresses: List of phone numbers or emails to send to.
-            Example: ['+11234567890'] for a single recipient.
+            Example: ['+11234567890'] for single recipient, ['+1111', '+1222'] for group.
         message: The text message to send.
     """
+    # Try to find existing chat first (much faster than /chat/new)
+    if len(addresses) == 1:
+        # Single recipient: search for existing DM
+        addr = addresses[0]
+        search_resp = await api_request("chat/query", method="POST", data={
+            "limit": 50,
+            "sort": "lastmessage",
+        })
+        chats = _extract_data(search_resp) or []
+        # Look for chat with matching identifier (DM style = 45)
+        for chat in chats:
+            if chat.get("style") == 45:
+                identifier = chat.get("chatIdentifier", "")
+                # Match if identifiers are same (exact or normalized phone)
+                if identifier == addr or _normalize_phone(identifier) == _normalize_phone(addr):
+                    chat_guid = chat.get("guid", "")
+                    if chat_guid:
+                        # Found existing chat - use fast send_message path
+                        return await send_message(chat_guid, message)
+
+    # No existing chat found - fall back to slow /chat/new endpoint
+    # This will take 120 seconds to timeout but the message WILL send successfully
     body = {
         "addresses": addresses,
         "message": message,
@@ -1188,7 +1278,7 @@ async def send_message_to_new_chat(
     resp = await api_request("chat/new", method="POST", data=body)
     status = resp.get("status", 0)
     if status == 200:
-        return f"Message sent to {', '.join(addresses)}."
+        return f"Message sent to {', '.join(addresses)} (via slow /chat/new endpoint)."
     return f"Send may have failed (status {status}): {resp.get('message', 'Unknown')}"
 
 
