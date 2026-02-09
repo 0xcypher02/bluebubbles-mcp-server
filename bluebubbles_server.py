@@ -1133,6 +1133,118 @@ async def query_messages(
 
 @mcp.tool()
 @_safe_call
+async def find_chat(
+    query: str,
+) -> str:
+    """Smart chat finder - works with contact names, phone numbers, group names, or emails.
+
+    RECOMMENDED for "read my chat with X" or "send message to X" workflows.
+    Automatically handles both individual contacts and group chats.
+
+    Examples:
+    - find_chat("Nick Balenzano") → finds contact, returns DM chat GUID
+    - find_chat("Dariungs") → searches group chats by name, returns GUID
+    - find_chat("+12039698060") → finds DM by phone number
+    - find_chat("user@example.com") → finds DM by email
+
+    Args:
+        query: Contact name, phone number, email, or group chat name to search for.
+
+    Returns:
+        Chat GUID with instructions for next steps (send_message or get_chat_messages).
+    """
+    # Strategy 1: If looks like phone/email, try direct DM lookup
+    if "@" in query or query.startswith("+") or query.replace("-", "").replace("(", "").replace(")", "").replace(" ", "").isdigit():
+        # Try as address
+        test_addresses = [query]
+        normalized = _normalize_phone(query)
+        if normalized != query:
+            test_addresses.append(normalized)
+
+        for addr in test_addresses:
+            constructed_guid = f"any;-;{addr}"
+            try:
+                resp = await api_request(f"chat/{constructed_guid}")
+                chat = _extract_data(resp)
+                if chat:
+                    return (
+                        f"Found DM chat:\n"
+                        f"  Contact: {_resolve_name(chat.get('chatIdentifier', 'Unknown'))}\n"
+                        f"  GUID: {chat.get('guid')}\n\n"
+                        f"Next: send_message(chat_guid=\"{chat.get('guid')}\", message=\"...\") to send\n"
+                        f"   or get_chat_messages(chat_guid=\"{chat.get('guid')}\") to read"
+                    )
+            except Exception:
+                continue
+
+    # Strategy 2: Search contacts by name, then try DM
+    resp = await api_request("contact")
+    contacts = _extract_data(resp) or []
+    search_lower = query.lower()
+
+    for c in contacts:
+        display = (c.get("displayName") or "").strip()
+        first = (c.get("firstName") or "").strip()
+        last = (c.get("lastName") or "").strip()
+        full = f"{first} {last}".strip()
+
+        if (search_lower in display.lower() or
+            search_lower in first.lower() or
+            search_lower in last.lower() or
+            search_lower in full.lower()):
+            # Found contact - try DM chat
+            phones = c.get("phoneNumbers") or []
+            emails = c.get("emails") or []
+            primary = phones[0].get("address", "") if phones else (emails[0].get("address", "") if emails else "")
+
+            if primary:
+                contact_name = display or full
+                test_addrs = [primary, _normalize_phone(primary)]
+                for addr in test_addrs:
+                    guid = f"any;-;{addr}"
+                    try:
+                        chat_resp = await api_request(f"chat/{guid}")
+                        chat = _extract_data(chat_resp)
+                        if chat:
+                            return (
+                                f"Found DM chat with {contact_name}:\n"
+                                f"  Phone: {primary}\n"
+                                f"  GUID: {chat.get('guid')}\n\n"
+                                f"Next: send_message(chat_guid=\"{chat.get('guid')}\", message=\"...\") to send\n"
+                                f"   or get_chat_messages(chat_guid=\"{chat.get('guid')}\") to read"
+                            )
+                    except Exception:
+                        continue
+
+    # Strategy 3: Search group chats by displayName
+    chat_resp = await api_request("chat/query", method="POST", data={
+        "limit": 1000,  # Max allowed by API (total chats: 1192)
+        "sort": "lastmessage",
+    })
+    chats = _extract_data(chat_resp) or []
+
+    for chat in chats:
+        if chat.get("style") == 43:  # Group chat
+            display = (chat.get("displayName") or "").strip()
+            if search_lower in display.lower():
+                guid = chat.get("guid", "")
+                return (
+                    f"Found group chat '{display}':\n"
+                    f"  GUID: {guid}\n"
+                    f"  Participants: {len(chat.get('participants', []))}\n\n"
+                    f"Next: send_message(chat_guid=\"{guid}\", message=\"...\") to send\n"
+                    f"   or get_chat_messages(chat_guid=\"{guid}\") to read"
+                )
+
+    return (
+        f"No chat found for '{query}'.\n"
+        f"Searched: contacts by name, DM chats by phone/email, and group chats by name.\n"
+        f"Try query_chats() to browse all chats, or use send_message_to_new_chat to create new."
+    )
+
+
+@mcp.tool()
+@_safe_call
 async def find_chat_by_address(
     address: str,
 ) -> str:
