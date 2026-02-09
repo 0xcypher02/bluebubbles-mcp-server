@@ -801,6 +801,113 @@ async def query_chats(
 
 @mcp.tool()
 @_safe_call
+async def get_contact_chat_history(
+    name: str,
+    limit: int = 50,
+) -> str:
+    """Get complete chat history with a contact by their name. Automatically
+    finds ALL chats (phone + email) and merges messages chronologically.
+
+    RECOMMENDED for "read my chat with X" requests when X is a person's name.
+    Handles contacts who switched between phone and email for iMessage.
+
+    Args:
+        name: Contact name (e.g. 'Nick Balenzano').
+        limit: Total messages to return across all chats (default 50).
+
+    Returns:
+        Merged message history from all chats with this contact.
+    """
+    # Find contact
+    resp = await api_request("contact")
+    contacts = _extract_data(resp) or []
+    search_lower = name.lower()
+    found_contact = None
+
+    for c in contacts:
+        display = (c.get("displayName") or "").strip()
+        first = (c.get("firstName") or "").strip()
+        last = (c.get("lastName") or "").strip()
+        full = f"{first} {last}".strip()
+
+        if (search_lower in display.lower() or
+            search_lower in first.lower() or
+            search_lower in last.lower() or
+            search_lower in full.lower()):
+            found_contact = c
+            break
+
+    if not found_contact:
+        return f"No contact found matching '{name}'. Use find_contact_by_name to search."
+
+    contact_name = (found_contact.get("displayName") or
+                   f"{found_contact.get('firstName', '')} {found_contact.get('lastName', '')}".strip())
+
+    # Get all addresses and find all chats
+    phones = found_contact.get("phoneNumbers") or []
+    emails = found_contact.get("emails") or []
+
+    all_addresses = []
+    for p in phones:
+        addr = p.get("address", "")
+        if addr:
+            all_addresses.append(addr)
+            normalized = _normalize_phone(addr)
+            if normalized != addr:
+                all_addresses.append(normalized)
+    for e in emails:
+        addr = e.get("address", "")
+        if addr:
+            all_addresses.append(addr)
+
+    # Find existing chats and collect messages from each
+    all_messages = []
+    chat_guids = []
+
+    for addr in all_addresses:
+        guid = f"any;-;{addr}"
+        try:
+            chat_resp = await api_request(f"chat/{guid}")
+            chat = _extract_data(chat_resp)
+            if chat:
+                chat_guids.append((addr, guid))
+                # Get messages from this chat
+                msg_resp = await api_request("message/query", method="POST", data={
+                    "chatGuid": guid,
+                    "limit": limit * 2,  # Over-fetch to ensure we get enough across all chats
+                    "sort": "DESC",
+                    "with": ["handle", "attachment"],
+                })
+                messages = _extract_data(msg_resp) or []
+                all_messages.extend(messages)
+        except Exception:
+            continue
+
+    if not all_messages:
+        return f"No chat history found for {contact_name}. No messages in any chat."
+
+    # Sort all messages by date (newest first)
+    all_messages.sort(key=lambda m: m.get("dateCreated", 0), reverse=True)
+
+    # Take top N after merge
+    merged = all_messages[:limit]
+
+    lines = [
+        f"Chat history with {contact_name} ({len(merged)} messages from {len(chat_guids)} chat(s))",
+        "=" * 40,
+    ]
+    if len(chat_guids) > 1:
+        lines.append(f"Note: {contact_name} has {len(chat_guids)} chats (phone + email merged):")
+        for addr, guid in chat_guids:
+            lines.append(f"  - {addr}")
+        lines.append("")
+
+    lines.extend(_format_messages_grouped(merged))
+    return "\n".join(lines)
+
+
+@mcp.tool()
+@_safe_call
 async def get_chat_messages(
     chat_guid: str,
     limit: int = 25,
@@ -1192,29 +1299,59 @@ async def find_chat(
             search_lower in first.lower() or
             search_lower in last.lower() or
             search_lower in full.lower()):
-            # Found contact - try DM chat
+            # Found contact - try ALL addresses (phones + emails)
+            contact_name = display or full
             phones = c.get("phoneNumbers") or []
             emails = c.get("emails") or []
-            primary = phones[0].get("address", "") if phones else (emails[0].get("address", "") if emails else "")
 
-            if primary:
-                contact_name = display or full
-                test_addrs = [primary, _normalize_phone(primary)]
-                for addr in test_addrs:
-                    guid = f"any;-;{addr}"
-                    try:
-                        chat_resp = await api_request(f"chat/{guid}")
-                        chat = _extract_data(chat_resp)
-                        if chat:
-                            return (
-                                f"Found DM chat with {contact_name}:\n"
-                                f"  Phone: {primary}\n"
-                                f"  GUID: {chat.get('guid')}\n\n"
-                                f"Next: send_message(chat_guid=\"{chat.get('guid')}\", message=\"...\") to send\n"
-                                f"   or get_chat_messages(chat_guid=\"{chat.get('guid')}\") to read"
-                            )
-                    except Exception:
-                        continue
+            all_addresses = []
+            for p in phones:
+                addr = p.get("address", "")
+                if addr:
+                    all_addresses.append(addr)
+                    normalized = _normalize_phone(addr)
+                    if normalized != addr:
+                        all_addresses.append(normalized)
+            for e in emails:
+                addr = e.get("address", "")
+                if addr:
+                    all_addresses.append(addr)
+
+            # Find all existing chats with this contact
+            found_chats = []
+            for addr in all_addresses:
+                guid = f"any;-;{addr}"
+                try:
+                    chat_resp = await api_request(f"chat/{guid}")
+                    chat = _extract_data(chat_resp)
+                    if chat:
+                        found_chats.append({
+                            "guid": chat.get("guid"),
+                            "identifier": chat.get("chatIdentifier"),
+                            "address": addr,
+                        })
+                except Exception:
+                    continue
+
+            if found_chats:
+                lines = [f"Found {len(found_chats)} chat(s) with {contact_name}:"]
+                for i, fc in enumerate(found_chats, 1):
+                    lines.append(f"\n{i}. {fc['identifier']}")
+                    lines.append(f"   GUID: {fc['guid']}")
+
+                if len(found_chats) == 1:
+                    lines.append(
+                        f"\nNext: send_message(chat_guid=\"{found_chats[0]['guid']}\", message=\"...\") to send"
+                    )
+                    lines.append(f"   or get_chat_messages(chat_guid=\"{found_chats[0]['guid']}\") to read")
+                else:
+                    lines.append(
+                        f"\nThis contact has multiple chats (phone + email)."
+                    )
+                    lines.append(f"Use get_chat_messages on EACH GUID to read full history,")
+                    lines.append(f"or use the most recent one (usually the email chat).")
+
+                return "\n".join(lines)
 
     # Strategy 3: Search group chats by displayName
     chat_resp = await api_request("chat/query", method="POST", data={
